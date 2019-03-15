@@ -9,7 +9,7 @@ This script analyses the depth of membrane deformation in a trajectory, which ha
 It should be run in a folder that contains these .gro files, and no other .gro files
 
 Usage:
-python3 depth_script_v4.3.py
+python3 depth_script.py
 
 v4.6 changes:
 	1.5 sized heatmap as that is all we need
@@ -198,15 +198,13 @@ def separate_leaflets(membrane, timestamp=0):
 
 def get_depth(leaflet): #identifies the top and bottom 10% of residues by height, and returns the difference of their means
         top_cutoff = np.percentile(leaflet[:, 3], 90)
-        bottom_cutoff = np.percentile(leaflet[:, 3], 10)
 
         top_ten_percent = leaflet[:, 3][leaflet[:, 3] > top_cutoff]
-        bottom_ten_percent = leaflet[:, 3][leaflet[:, 3] < bottom_cutoff]
 
         average_top = np.mean(top_ten_percent)
-        average_bottom = np.mean(bottom_ten_percent)
+        bottom = np.min(leaflet[:, 3])
 
-        depth = average_top - average_bottom
+        depth = average_top - bottom
         return depth
 
 def switchers(source, destination, source_old, timestamp = 0):
