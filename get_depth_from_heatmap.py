@@ -8,7 +8,7 @@ Created on Fri Mar 15 15:09:19 2019
 
 import numpy as np
 
-hm = np.loadtxt("combined_lower_heatmap.dat")
+hm = np.loadtxt("combined_upper_heatmap.dat")
 
 hm_1d = np.reshape(hm, -1)
 hm_no_nan = hm_1d[~np.isnan(hm_1d)]
