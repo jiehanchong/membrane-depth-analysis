@@ -15,5 +15,5 @@ hm2 = hm - np.nanmin(hm)
 
 plt.imshow(hm2)
 plt.colorbar()
-plt.savefig("combined_upper_heatmap_10-16.svg")
+plt.savefig("combined_upper_heatmap_zero_z_origin.svg")
 plt.close()
