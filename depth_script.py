@@ -81,13 +81,13 @@ frame_n = 1 #initialise frame counter
 def separate_leaflets(membrane, timestamp=0):
     #input is array with column0=residue, column1=x, column2=y, column3=z
     #output is a tuple of (upper_leaflet, lower_leaflet)
-    cutoff = 2
-    warning_list = []
+    cutoff = 2 #nm
+    warning_list = [] #initialise list of warnings for printing at the end
 
-    def branching_function(membrane, start_from, cutoff):
+    def branching_function(membrane, start_from, cutoff): #starts at a lipid, extends a network of PO4 within cutoff of each other, and returns the network as one leaflet, assigning the remaining PO4 to the other leaflet
         coordinates = membrane[:, [1, 2, 3]]
         difference = coordinates - coordinates[start_from]
-        distance = (difference[:, 0]**2 + difference[:, 1]**2 + difference[:, 2]**2)**0.5
+        distance = (difference[:, 0]**2 + difference[:, 1]**2 + difference[:, 2]**2)**0.5 
         in_leaflet1 = (distance < cutoff) & ~ (distance == 0) #exclude the starting atom so it can go to the head of the table later
         in_leaflet2 = distance > cutoff
         leaflet1 = np.vstack([membrane[start_from], membrane[in_leaflet1]]) #adds back the starting atom excluded previously
