@@ -180,6 +180,11 @@ def make_heatmap_single_frame(coords, range_x, range_y, bins=args.bins):
 
     return heatmap, hm_residues_per_bin
 
+def init_counter(x):
+    # Store counter for later use
+    global counter
+    counter = x
+
 def mp_wrapper(file):
     # Extract data
     coords, timestamp, range_x, range_y = extract_data(file)
@@ -193,6 +198,11 @@ def mp_wrapper(file):
     # Produce depth map
     heatmap, residues_per_bin = make_heatmap_single_frame(coords, range_x, range_y)
 
+    with counter.get_lock():
+        counter.value += 1
+
+    print(f'Processed frame {counter.value} with timestamp {timestamp} ps')
+
     return this_frame_array, heatmap, residues_per_bin
 
 #### #### #### ####    
@@ -200,6 +210,7 @@ def mp_wrapper(file):
 #### #### #### ####
 if __name__ == '__main__':
     gro_list = glob.glob('*.gro')
+    number_of_frames = len(gro_list)
 
     ## Analysis if single process ##
     if args.mp == False:
@@ -234,12 +245,15 @@ if __name__ == '__main__':
 
     ## Analysis if multiprocess ##
     if args.mp == True:
-        import multiprocessing  # Import here to avoid import if not using    
+        import multiprocessing, ctypes  # Import here to avoid import if not using    
         print('Analysing gro files in parallel')
+
+        # Set up process counter
+        counter = multiprocessing.Value(ctypes.c_int, 0)
 
         p_count = multiprocessing.cpu_count()
 
-        with multiprocessing.Pool(p_count) as p:
+        with multiprocessing.Pool(processes=p_count, initializer=init_counter, initargs=(counter,)) as p:
             results = p.map(mp_wrapper, gro_list)
 
         print('Combining results from parallel processes')
@@ -250,7 +264,9 @@ if __name__ == '__main__':
 
         residues_per_bin = sum([item[2] for item in results])
 
+        np.seterr(divide='ignore', invalid='ignore')
         heatmap = hm_total / residues_per_bin
+        np.seterr(divide='warn', invalid='warn')
 
     depth_array = depth_array[depth_array[:, 0].argsort()] # sort depths by timestamp
 
