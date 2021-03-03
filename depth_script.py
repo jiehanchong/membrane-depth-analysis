@@ -1,414 +1,393 @@
-#!/usr/bin/python3
-
-"""
-Created on Fri Dec 21 09:45:33 2018
-
-@author: umjcho
-
-This script analyses the depth of membrane deformation in a trajectory, which has been formatted as a series of separate .gro files
-It should be run in a folder that contains these .gro files, and no other .gro files
-
-Usage:
-python3 depth_script.py
-
-v4.6 changes:
-	1.5 sized heatmap as that is all we need
-	Number of bins reduced accordingly
-
-v4.5 changes:
-    Double sized heatmap, to capture the edges of the rotating membrane
-    Suppress scientific notation when printing arrays to file
-    Provides an escape mechanism for if there is no timestamp, allowing a heatmap to be drawn on a non-trajectory .gro file
-    v4.4 introduced a bug where the output heatmap files for the upper and lower leaflet are identical. This is now fixed
-
-v4.4 changes:
-	For leftover atoms, uses only disc neighbours method (neighbours with distance < 4nm from missing atom, and with z-coordinates within a 1nm range of the missing atom) to assign to a leaflet. This is to avoid assigning PO4 atoms that have skipped the z-axis PBC boundary, as this would massively skew the leaflet depth in that region of the heatmap.
-    Output list of atoms not assigned that was added in v4.3 now works
-    Adds identification of lipids that switch leaflets
-
-v4.3 retained changes:
-    Writes atoms that are not assigned to a leaflet to a file for easier analysis
-
-v4.2 retained changes:
-    If atoms are missed by both branching directions, assign to leaflet of nearest neighbour which is already assigned a leaflet
-    Adds a warning if more than 25% of atoms are missed despite branching in both directions
-
-v4.1 retained changes:
-    Changed criteria for detecting branching bleed, fixing bug where bleed detection would fail in cases of subtotal bleed
-    Changed criteria for detecting branching failure, as original criteria only detected total branching failure, and ignored premature termination
-    Added detection of branch failure for the check run
-
-v4 retained changes:
-    Leaflets are separated using a branching algorithm instead of separating by height
-    If branching bleeds across leaflets, algorithm repeated with lower branching cutoff
-    All analyses are performed on each leaflet separately
-
-v2 retained changes:
-    Calculates depth correctly regardless of whether dome points upward or downward
-    Orders frames by timestamp instead of modification time, as simply copying files would break modification time
-    If run on files without PO4 atoms, exits with an informative message instead of crashing
-"""
-
+import glob, multiprocessing, datetime, ctypes, functools, argparse, sys
 import numpy as np
-import sys, os
 import matplotlib.pyplot as plt
-np.set_printoptions(suppress=True)
-
-#Generate list of all the .gro files in the directory
-gro_list = np.array([f for f in os.listdir('.') if f.endswith('.gro')])
-
-bins = 75 #number of bins in heatmap
-
-depths = np.zeros(3) #initialise table of depths
-
-warnings = []
-old_leaflet1 = np.array([])
-old_leaflet2 = np.array([])
-switched_to_leaflet1 = np.empty((0, 6))
-switched_to_leaflet2 = np.empty((0, 6))
-
-def initialize_heatmap():
-    heatmap = np.zeros((bins, bins)) #initialise heatmap
-    heatmap[:] = np.nan #initialise heatmap
-    hm_residues_per_bin = np.zeros((bins, bins)) #initialise count of residues per bin for heatmap averaging
-    return heatmap, hm_residues_per_bin #package heatmap and residues data into a tuple for feeding into function
-
-upper_heatmap_data = initialize_heatmap()
-lower_heatmap_data = initialize_heatmap()
-
-frame_n = 1 #initialise frame counter
-
-def separate_leaflets(membrane, timestamp=0):
-    #input is array with column0=residue, column1=x, column2=y, column3=z
-    #output is a tuple of (upper_leaflet, lower_leaflet)
-    cutoff = 2 #nm
-    warning_list = [] #initialise list of warnings for printing at the end
-
-    def branching_function(membrane, start_from, cutoff): #starts at a lipid, extends a network of PO4 within cutoff of each other, and returns the network as one leaflet, assigning the remaining PO4 to the other leaflet
-        coordinates = membrane[:, [1, 2, 3]]
-        difference = coordinates - coordinates[start_from]
-        distance = (difference[:, 0]**2 + difference[:, 1]**2 + difference[:, 2]**2)**0.5 
-        in_leaflet1 = (distance < cutoff) & ~ (distance == 0) #exclude the starting atom so it can go to the head of the table later
-        in_leaflet2 = distance > cutoff
-        leaflet1 = np.vstack([membrane[start_from], membrane[in_leaflet1]]) #adds back the starting atom excluded previously
-        leaflet2 = membrane[in_leaflet2]
-
-        line_to_check = 1
-        while line_to_check < len(leaflet1):
-
-            reference = leaflet1[line_to_check][[1, 2, 3]]
-            leaflet2_coordinates = leaflet2[:, [1, 2, 3]]
-
-            difference = leaflet2_coordinates - reference
-            distance = (difference[:, 0]**2 + difference[:, 1]**2 + difference[:, 2]**2)**0.5
-            in_leaflet1 = distance < cutoff
-
-            leaflet1 = np.vstack([leaflet1, leaflet2[in_leaflet1]])
-            leaflet2 = leaflet2[np.invert(in_leaflet1)]
-
-            line_to_check += 1
-
-        return leaflet1, leaflet2
-
-    first_run = branching_function(membrane, 0, cutoff)
-
-    while len(first_run[1]) < (len(first_run[0]) * 0.5): #if branching has bled across bilayers, reduce cutoff and retry until bleeding stops
-        cutoff = cutoff * 0.9
-        first_run = branching_function(membrane, 0, cutoff)
-
-    if len(first_run[0]) < (len(first_run[1]) * 0.5): #if branching fails, branch from elsewhere
-        branch_start = 1
-        while len(first_run[0]) < (len(first_run[1]) * 0.5):
-            first_run = branching_function(membrane, branch_start, cutoff)
-            branch_start += 1
-
-    leaflet2_start = first_run[1][0] #run in opposite direction to ensure symmetry
-    check_start = np.where((membrane == leaflet2_start).all(axis=1))
-    check_run = branching_function(membrane, check_start, cutoff)
-
-    if len(check_run[0]) < (len(check_run[1]) * 0.5): #if branching fails, branch from elsewhere
-        check_index = 1
-        while len(check_run[0]) < (len(check_run[1]) * 0.5):
-            leaflet2_start = first_run[1][check_index]
-            check_start = np.where((membrane == leaflet2_start).all(axis=1))
-            check_run = branching_function(membrane, check_start, cutoff)
-            check_index += 1
-
-    leaflet1 = first_run[0]
-    leaflet2 = check_run[0]
-
-    if len(np.setdiff1d(leaflet1[:, 0], leaflet2[:, 0])) != len(leaflet1) or len(np.setdiff1d(leaflet2[:, 0], leaflet1[:, 0])) != len(leaflet2):
-        print('FATAL ERROR: Despite bleed detection, leaflet1 and leaflet2 contain the same atoms at time ' + str(timestamp) + ' ps')
-        sys.exit()
-
-    branched_atoms = np.append(leaflet1[:, 0], leaflet2[:, 0])
-
-    if len(np.setdiff1d(membrane[:, 0], branched_atoms)) != 0: #if atoms are missed by combination of forwards and backwards runs
-
-        missed_atoms = np.setdiff1d(membrane[:, 0], branched_atoms)
-        if len(missed_atoms) > (len(branched_atoms) * 0.25):
-            print('WARNING: More than 25% of atoms missed during branching')
-
-        def get_neighbours(search_centre, leaflet, search_radius=4): #gets number of neighbours in the leaflet provided.
-            adjusted_x = leaflet[:, 1] - search_centre[0] #convert coordinate origin to location of missing residue
-            adjusted_y = leaflet[:, 2] - search_centre[1]
-            adjusted_z = leaflet[:, 3] - search_centre[2]
-
-            dist = (adjusted_x**2 + adjusted_y**2 + adjusted_z**2)**0.5 # distance of PO4 from center missing residue
-
-            search_sphere_contains = leaflet[dist < search_radius, :] #atoms in the search sphere
-            search_disc_contains = search_sphere_contains[abs(search_sphere_contains[:, 3] - search_centre[2]) < 1, :]
-
-            number_of_atoms_in_area = len(search_disc_contains)
-
-            return number_of_atoms_in_area, dist
+from sklearn.cluster import DBSCAN
 
 
-        for resid in missed_atoms:
-
-            residue_is_on_row = membrane[:, 0] == resid
-            search_centre = membrane[residue_is_on_row, [1,2,3]]
-
-            leaflet1_get_neighbours = get_neighbours(search_centre, leaflet1)
-            leaflet2_get_neighbours = get_neighbours(search_centre, leaflet2)
-
-            leaflet1_distance = np.min(leaflet1_get_neighbours[1])
-            leaflet2_distance = np.min(leaflet2_get_neighbours[1])
-
-            leaflet1_neighbours = leaflet1_get_neighbours[0]
-            leaflet2_neighbours = leaflet2_get_neighbours[0]
-
-            if leaflet1_neighbours > leaflet2_neighbours:
-                leaflet1 = np.vstack([leaflet1, membrane[residue_is_on_row, :]])
-            elif leaflet2_neighbours > leaflet1_neighbours:
-                leaflet2 = np.vstack([leaflet2, membrane[residue_is_on_row, :]])
-            else:
-                warning_details = [resid, timestamp]
-                warning_list = warning_list + [warning_details]
-                print('WARNING: Unable to assign residue ' + str(resid) + ' at time ' + str(timestamp))
-                print('Distance from leaflet1 was ' + str(leaflet1_distance) + ' nm')
-                print('Distance from leaflet2 was ' + str(leaflet2_distance) + ' nm')
-                print('There were ' + str(leaflet1_neighbours) + ' neighbours in leaflet1')
-                print('There were ' + str(leaflet2_neighbours) + ' neighbours in leaflet2')
-                print('')
-
-    return (leaflet1,  leaflet2, warning_list)
+##  ##  ##  ##  ##
+##   FUNCTIONS  ##
+##  ##  ##  ##  ##
 
 
-
-def get_depth(leaflet): #identifies the top and bottom 10% of residues by height, and returns the difference of their means
-        top_cutoff = np.percentile(leaflet[:, 3], 90)
-
-        top_ten_percent = leaflet[:, 3][leaflet[:, 3] > top_cutoff]
-
-        average_top = np.mean(top_ten_percent)
-        bottom = np.min(leaflet[:, 3])
-
-        depth = average_top - bottom
-        return depth
-
-def switchers(source, destination, source_old, timestamp = 0):
-    left_source = np.setdiff1d(source_old[:, 0], source[:, 0]) #check what lipids left source
-    switched_to_destination = destination[np.isin(destination[:, 0], left_source)] #Entered destination having left source
-    time_column = np.full((len(switched_to_destination), 1), timestamp) #column of time to add to switchlist
-    switched_to_destination_with_time = np.hstack([switched_to_destination, time_column]) #add time column
-    return switched_to_destination_with_time
-
-lipid_dict = {
-        "POPC ": 1,
-        "POPE ": 2,
-        "POPS ": 3,
-        "POP2 ": 4,
-        "DPSM ": 5,
-        "CHOL ": 6
-        }
-
-for path in gro_list:
-
-    #First we parse the resid and coordinates from .gro file
-    frame = open(path)
-    data = frame.read().splitlines() #read the frame to a list, one line per list
-    numlen = 0
-
-    coords = np.zeros((0,5))
-    firstrow = data[0] # get timestamp
-    time_starts_at = str.find(firstrow, ' t=') + 3 #find the position of the string 't=', which precedes the timestamp
-
-    if time_starts_at > 10:     #this will be true if there is a timestamp
-        timestamp = float(firstrow[time_starts_at:])
-    else:   #if there is no timestamp, then set timestamp to 0
+def get_timestamp(frame):
+    with open(frame, 'r') as f:
+        first_line = f.readline()
+    pars = np.array(first_line.split(' '))
+    pars = pars[pars != '']
+    t_index = np.where(pars == 't=')[0]      
+    if len(t_index != 0):
+        timestamp = pars[t_index + 1].item()
+        timestamp = float(timestamp)
+    else:                                           
         timestamp = 0
-
-    for row in data: #convert resID and coordinates into a numpy array
-
-        if row[10:15] == '  PO4': #only import the PO4 coordinates
-
-            if numlen == 0: #determine the length of coordinate string. Only do this the first time.
-                first_dec = row.find('.')
-                second_dec = row.find('.', first_dec +1 )
-                numlen = second_dec - first_dec
-
-            res = row[0:5]
-            x = row[20: 20 + numlen]
-            y = row[20 + numlen: 20 + numlen*2]
-            z = row[20 + numlen*2: 20 + numlen*3]
-
-            lipid_type = row[5:10]
-            lipid_id = lipid_dict.get(lipid_type)
-            row_coords = np.array([res, x , y, z, lipid_id], dtype='float')
-
-            coords = np.vstack([coords, row_coords])
-
-        else:
-            continue
-
-    frame.close()
-
-    if len(coords) == 0: #if no coordinates have been imported (which only happens if there is no PO4), move to next file
-        continue
-
-    separated_leaflets = separate_leaflets(coords, timestamp) #separate leaflets
-
-    warnings = warnings + separated_leaflets[2]
-
-    leaflet1 = separated_leaflets[0]
-    leaflet2 = separated_leaflets[1]
-    leaflet1_mean_height = np.mean(leaflet1[:, 3])
-    leaflet2_mean_height = np.mean(leaflet2[:, 3])
-    if leaflet1_mean_height >  leaflet2_mean_height: #Assign leaflets to upper or lower
-        upper_leaflet = leaflet1
-        lower_leaflet = leaflet2
-    elif leaflet2_mean_height > leaflet1_mean_height:
-        upper_leaflet = leaflet2
-        lower_leaflet = leaflet1
-    elif leaflet1_mean_height == leaflet2_mean_height:
-        print('Error: Leaflet heights are the same')
-        sys.exit()
-
-    if len(old_leaflet1) != 0 and len(old_leaflet2) != 0: #if this isn't the first run
-        switched_to_leaflet1_this_frame = switchers(leaflet2, leaflet1, old_leaflet2, timestamp = timestamp)
-        if len(switched_to_leaflet1_this_frame) > 0:
-            switched_to_leaflet1 = np.vstack([switched_to_leaflet1, switched_to_leaflet1_this_frame])
-
-        switched_to_leaflet2_this_frame = switchers(leaflet1, leaflet2, old_leaflet1, timestamp = timestamp)
-        if len(switched_to_leaflet2_this_frame) > 0:
-            switched_to_leaflet2 = np.vstack([switched_to_leaflet2, switched_to_leaflet2_this_frame])
-
-    old_leaflet1 = leaflet1
-    old_leaflet2 = leaflet2
+    return timestamp
 
 
-    #Now obtain the depths
-    upper_depth = get_depth(upper_leaflet)
-    lower_depth = get_depth(lower_leaflet)
+def get_coord_string_length(file):
+    with open(file, 'r') as f:
+        line_found = False
+        while line_found == False:
+            line = f.readline()
+            resid = line[0:5]
+            resname = line[5:10]
+            atomname = line[10:15]
+            atomid = line[15:20]
+            try:
+                int(resid)
+                int(atomid)
+            except:
+                continue
+            try:
+                int(resname)
+                int(atomname)
+            except:
+                decimal_index1 = line.find('.')
+                decimal_index2 = line.find('.', decimal_index1 + 1)
+                coord_length = decimal_index2 - decimal_index1
+                return coord_length
 
-    depths = np.vstack((depths, [timestamp, upper_depth, lower_depth]))
+
+def get_coords(file, coord_length):
+    arr = np.genfromtxt(file, delimiter=[5, 5, 5, 5, coord_length, coord_length, coord_length], dtype='S')
+    
+    po4_arr = arr[arr[:, 2] == b'  PO4']
+
+    resid_coords_arr = po4_arr[:, [0,4,5,6]].astype('f')
+
+    return resid_coords_arr
 
 
-    #Generate heatmap of z-coordinates over time
-    lastline_split = np.array(data[-1].split(' ')) #extract box size from last line
-    lastline_numbers = lastline_split[lastline_split != '']
-    range_x = float(lastline_numbers[0])
-    range_y = float(lastline_numbers[1])
+def get_depth(leaflet): 
+    # Get average z of top 10%
+    top_cutoff = np.percentile(leaflet[:, 3], 90)
+    top_ten_percent = leaflet[:, 3][leaflet[:, 3] > top_cutoff]
+    average_top = np.mean(top_ten_percent)
 
-    def make_heatmap(coords, heatmap_data, bins, range_x, range_y): #adds to a pre-initialised heatmap
-        heatmap = heatmap_data[0]
-        hm_residues_per_bin = heatmap_data[1]
-        x_binwidth = range_x * 1.5 / bins
-        y_binwidth = range_y * 1.5 / bins
-        x_start = -0.25 * range_x #heatmap origin, which is outside the actual simulation in order to capture all information
-        y_start = -0.25 * range_y
+    # Get z of lowest as this is fixed relative to protein, to which trajectory is fitted
+    bottom = np.min(leaflet[:, 3])
 
-        for ybin in range(1, bins+1):                                               #in each row
-            ybin_start = coords[:, 2] > (y_start + y_binwidth * (ybin - 1))   #boolean for y > start of bin
-            ybin_end = coords[:, 2] <= (y_start + y_binwidth * ybin)              #boolean for y < end of bin
-            ybin_selector = ybin_start * ybin_end
-            this_ybin = coords[ybin_selector, :]                        #select residues in this ybin
+    # Calculate depth
+    depth = average_top - bottom
 
-            for xbin in range(1, bins+1):                                           #go through the bins
-                xbin_start = this_ybin[:, 1] > (x_start + x_binwidth * (xbin - 1))
-                xbin_end = this_ybin[:, 1] <= (x_start + x_binwidth * xbin)
-                xbin_selector = xbin_start * xbin_end
-                thisbin = this_ybin[xbin_selector, :]
+    return depth
 
-                if np.isnan(heatmap[xbin - 1, ybin -1]): #if the heatmap bin is currently empty
-                    total_z_this_bin = sum(thisbin[:, 3])
-                    hm_residues_per_bin[xbin - 1, ybin -1] = len(thisbin[:, 3])
-                else: #if the heatmap bin already contains data
-                    total_z_this_bin = (heatmap[xbin - 1, ybin -1] * hm_residues_per_bin[xbin - 1, ybin -1]) + sum(thisbin[:, 3]) #generate a new total from the previous contents and the current frame
-                    hm_residues_per_bin[xbin - 1, ybin -1] = hm_residues_per_bin[xbin - 1, ybin -1] + len(thisbin[:, 3]) #increase the residue count accordingly
 
-                if len(thisbin[:, 3]) > 0: #if there was anything in this bin in this frame
-                    heatmap[xbin - 1, ybin -1] = total_z_this_bin / hm_residues_per_bin[xbin - 1, ybin -1] #update the average value in the heatmap
+def bin_cutoffs(coords, axis, bins):
+    axis_index = {'x': 1,
+                    'y': 2}
 
-        return (heatmap, hm_residues_per_bin)
+    i = axis_index[axis]
 
-    upper_heatmap_data = make_heatmap(upper_leaflet, upper_heatmap_data, bins, range_x, range_y)
-    lower_heatmap_data = make_heatmap(lower_leaflet, lower_heatmap_data, bins, range_x, range_y)
+    ax_max = coords[:, i].max()
+    range_min = ax_max * -0.25
+    range_max = ax_max * 1.25
+    range_step = (range_max - range_min) / (bins + 1)
 
-    frame_n = frame_n + 1
+    return np.arange(range_min, range_max, range_step)
 
-if len(coords) == 0: #if having looped through all files, there are still no PO4 atoms, exit program
-    print('No .gro files in this folder contain PO4 atoms')
-    sys.exit()
 
-depths = np.delete(depths, 0, axis=0) #remove initialisation column
-depths = depths[depths[:, 0].argsort()] #sort depths by timestamp
+def binner(arr, bin_cutoffs, axis):
+    axis_index = {'x': 1,
+                  'y': 2}
 
-#Export depths to file
-np.savetxt("depths.dat", depths)
+    i = axis_index[axis]
 
-#Write mean depths to file
-f = open('depths.txt', 'w+')
-f.write("Depth of upper leaflet dome = " + str(np.mean(depths[:, 1])) + " nm\n" +
-        "Depth of lower leaflet dome = " + str(np.mean(depths[:, 2])) + " nm")
-f.close()
+    bin_starts = bin_cutoffs[:-1]
+    bin_ends = bin_cutoffs[1:]
 
-#Output graph of change in depth over course of simulation
-u_DoT = plt.plot(depths[:, 0], depths[:, 1], linewidth=0.5)
-plt.savefig("upper_leaflet_depth_over_time.svg")
-plt.close()
+    split = [arr[(arr[:, i] >= bin_start) 
+             & (arr[:, i] < bin_end)] 
+             for bin_start, bin_end in zip(bin_starts, bin_ends)]
 
-l_DoT = plt.plot(depths[:, 0], depths[:, 2], linewidth=0.5)
-plt.savefig("lower_leaflet_depth_over_time.svg")
-plt.close()
+    return split
 
-#Output heatmap data
-np.savetxt("upper_heatmap.dat", upper_heatmap_data[0])
-np.savetxt("rescounts_upper_heatmap.dat", upper_heatmap_data[1])
+def separate_leaflets(coords, timestamp):
+    X = coords[:, [1,2,3]]
+    db = DBSCAN(eps=2, min_samples=6).fit(X)
+    cluster1_len = len(db.labels_[db.labels_ == 0])
+    cluster2_len = len(db.labels_[db.labels_ == 1])
+    cluster_diff = abs(cluster1_len - cluster2_len)
+    biggest_cluster_len = max(cluster1_len, cluster2_len)
+    main_clusters_size_unmatched = cluster_diff > (biggest_cluster_len * 0.05)
+    less_than_2_main_clusters = len(set(db.labels_)) < 3
+    n = 7
+    while less_than_2_main_clusters or main_clusters_size_unmatched:
+        db = DBSCAN(eps=2, min_samples=n).fit(X)
+        cluster1_len = len(db.labels_[db.labels_ == 0])
+        cluster2_len = len(db.labels_[db.labels_ == 1])
+        cluster_diff = abs(cluster1_len - cluster2_len)
+        biggest_cluster_len = max(cluster1_len, cluster2_len)
+        main_clusters_size_unmatched = cluster_diff > (biggest_cluster_len * 0.05)
+        less_than_2_main_clusters = len(set(db.labels_)) < 3
+        n += 1
+    leaflet1 = coords[db.labels_ == 0]
+    leaflet2 = coords[db.labels_ == 1]
+    outliers = coords[(db.labels_ != 0) & (db.labels_ != 1)]
 
-np.savetxt("lower_heatmap.dat", lower_heatmap_data[0])
-np.savetxt("rescounts_lower_heatmap.dat", lower_heatmap_data[1])
+    to_leaflet1 = []
+    to_leaflet2 = []
+    unassigned = []
+    for item in outliers:
+        diff1 = leaflet1[:, [1,2,3]] - item[1:]
+        dist1 = (diff1[:,0]**2 + diff1[:,1]**2 + diff1[:,2]**2)**0.5
+        diff2 = leaflet2[:, [1,2,3]] - item[1:]
+        dist2 = (diff2[:,0]**2 + diff2[:,1]**2 + diff2[:,2]**2)**0.5
+        for n in range(4,7):
+            neighbours1 = sum(dist1 <= n)
+            neighbours2 = sum(dist2 <= n)
+            if neighbours1 != neighbours2:
+                break
+        if neighbours1 > neighbours2:
+            to_leaflet1.append(item)
+        elif neighbours2 > neighbours1:
+            to_leaflet2.append(item)
+        elif neighbours1 == neighbours2:
+            unassigned.append(item)
+    if to_leaflet1:
+        leaflet1 = np.vstack((leaflet1, to_leaflet1))
+    if to_leaflet2:
+        leaflet2 = np.vstack((leaflet2, to_leaflet2))
+    if unassigned:
+        unassigned_array = np.empty((len(unassigned), len(unassigned[0]) +1))
+        unassigned_array[:, -1] = timestamp
+        unassigned_array[:, :-1] = np.vstack(unassigned)
+        unassigned = unassigned_array
+        for item in unassigned:
+            print('Unassigned residue')
+            print(f'resid: {int(item[0])}')
+            print(f'time : {int(timestamp)} ps')
+            print('This will be logged in \"unassigned_lipids.dat\"')
+            print()
+    else:
+        unassigned = np.array(unassigned)
 
-hmplot = plt.imshow(upper_heatmap_data[0])
-plt.colorbar(hmplot)
-plt.savefig("upper_heatmap.pdf")
-plt.savefig("upper_heatmap.svg")
-plt.close()
+    return leaflet1, leaflet2, unassigned
 
-hmplot = plt.imshow(lower_heatmap_data[0])
-plt.colorbar(hmplot)
-plt.savefig("lower_heatmap.pdf")
-plt.savefig("lower_heatmap.svg")
-plt.close()
 
-ctplot = plt.contourf(upper_heatmap_data[0])
-plt.colorbar(ctplot)
-plt.savefig("upper_contour.pdf")
-plt.savefig("upper_contour.svg")
-plt.close()
+def make_depthmap(coords, x_bin_cutoffs, y_bin_cutoffs, bins):
+    x_binned = binner(coords, x_bin_cutoffs, 'x')
+    xy_binned = [binner(j, y_bin_cutoffs, 'y') for j in x_binned]
 
-ctplot = plt.contourf(lower_heatmap_data[0])
-plt.colorbar(ctplot)
-plt.savefig("lower_contour.pdf")
-plt.savefig("lower_contour.svg")
-plt.close()
+    depthsum = np.empty((bins, bins))
+    rescount = np.empty((bins, bins))
 
-if len(warnings) > 0:
-    warnings = np.array(warnings)
-    np.savetxt("atoms_not_assigned.dat", warnings)
+    for x in range(0,bins):
+        for y in range(0, bins):
+            depthsum[x, y] = np.sum(xy_binned[x][y][:, 3])
+            rescount[x, y] = len(xy_binned[x][y])
 
-switched_to_leaflet1 = np.hstack([switched_to_leaflet1, np.full((len(switched_to_leaflet1), 1), 1)])
-switched_to_leaflet2 = np.hstack([switched_to_leaflet2, np.full((len(switched_to_leaflet2), 1), 2)])
-lipids_that_switched_leaflets = np.vstack([switched_to_leaflet1, switched_to_leaflet2])
-np.savetxt("switched.dat", lipids_that_switched_leaflets) #columns are     0-resid     1-x     2-y     3-z     4-lipid_type     5-timestamp     6-switched_to
+    return depthsum, rescount
+
+
+def main_loop(file, bins):
+    coord_length = get_coord_string_length(file)
+    coords = get_coords(file, coord_length)
+
+    timestamp = get_timestamp(file)
+
+    leaflet1, leaflet2, unassigned = separate_leaflets(coords, timestamp)
+
+    function_output = [timestamp]
+
+    for leaflet in (leaflet1, leaflet2):
+        depth = get_depth(leaflet)
+
+        x_cutoffs = bin_cutoffs(leaflet, 'x', bins)
+        y_cutoffs = bin_cutoffs(leaflet, 'y', bins)
+        depthsum, rescount = make_depthmap(leaflet, x_cutoffs, y_cutoffs, bins)
+
+        function_output.append((depth, depthsum, rescount))
+
+    function_output.append(unassigned)
+
+    return function_output # list of  index 0 = timestamp, 
+                           #                1 = (depth, depthsum, rescount),
+                           #                2 = (depth, depthsum, rescount)
+                           #                3 = unassigned_items
+
+
+def chunks(list, chunksize):
+    for i in range(0, len(list), chunksize):
+        yield list[i: i+chunksize]
+
+
+if __name__ == '__main__':
+    start_time = datetime.datetime.now()
+    np.set_printoptions(suppress=True)
+    plt.switch_backend('agg')
+
+    ## ARGUMENT PARSER ##
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter, 
+        description='''
+            Calculate depth of lipid bilayer in a trajectory.
+            Trajectory should be in GRO format, one file per frame.
+            Script should be run in a folder where the only GRO files are part of the trajectory.
+
+            Outputs:
+            depths.dat                  - timestep (ps) in first column, depth (nm) in second column
+            average_depth.txt           - Text file stating the average depth over trajectory duration
+            depth_over_time.svg         - plot of the data in depths.dat
+            depthmap.dat                - data of depthmap of average depths
+            depthmap_bin_rescounts.dat  - number of residues in each bin of depthmap.dat
+            depthmap.pdf                - plot of data in depthmap.dat
+            depthmap.svg                - plot of data in depthmap.dat
+            contour.pdf                 - contour map of data in depthmap.dat
+            contour.svg                 - contour map of data in depthmap.dat
+            unassigned_lipids.dat       - columns - 0: resid, 1: x, 2: y, 3: z, 4: time when not assigned
+            running_time.txt            - performance metrics''')
+    p.add_argument('--bins',
+                '-b',
+                help='''Number of bins in X and Y axis for output depth map. 
+                        It is assumed that the X and Y dimensions of the 
+                        simulation box are the same. Default is 75.''',
+                default=75,
+                type=int)
+    p.add_argument('--chunksize',
+                '-c',
+                help='''Number of frames processed before outputs are
+                        consolidated to avoid overloading system. Can be reduced 
+                        for very large systems. Default is 100.''',
+                type=int,
+                default=100)
+    p.add_argument('--nomp',
+                dest='nomp',
+                action='store_true',
+                help='Turn off multiprocessing.')
+    args = p.parse_args()
+
+
+    ##  ##  ##  ##  ##
+    ##  ALGORITHM   ##
+    ##  ##  ##  ##  ##
+
+    gro_list = glob.glob('*gro')
+
+    counter = 0
+    n_frames = len(gro_list)
+    time_list = []
+    depth_list1 = []
+    depthsum1 = np.zeros((args.bins, args.bins))
+    rescount1 = np.zeros((args.bins, args.bins))
+    depth_list2 = []
+    depthsum2 = np.zeros((args.bins, args.bins))
+    rescount2 = np.zeros((args.bins, args.bins))
+    unassigned = []
+
+    if not args.nomp:
+        # Fix start_time and n_frames in main loop as they are constant
+        pain_loop = functools.partial(main_loop, bins=args.bins)
+
+        # Split gro_list into chunks for analysis
+        chunk_generator = chunks(gro_list, args.chunksize)
+        for chunk in chunk_generator:
+            with multiprocessing.Pool() as p:
+                results = p.map(pain_loop, chunk)
+
+            time_list += [item[0] for item in results]
+            depth_list1 += [item[1][0] for item in results]
+            depthsum1 += sum(item[1][1] for item in results)
+            rescount1 += sum(item[1][2] for item in results)
+            depth_list2 += [item[2][0] for item in results]
+            depthsum2 += sum(item[2][1] for item in results)
+            rescount2 += sum(item[2][2] for item in results)
+            unassigned += [item[3] for item in results if item[3].any()]
+
+            counter += 1
+            if len(chunk) == args.chunksize:
+                frames_analysed = counter * args.chunksize
+                percent_progress = frames_analysed / n_frames * 100
+                print(f'{round(percent_progress, 2)}% complete')
+                elapsed_time = datetime.datetime.now() - start_time
+                print(f'{frames_analysed}/{n_frames} frames analysed in {elapsed_time}')
+                print(f'Average {elapsed_time/frames_analysed} per frame')
+                remaining_time = elapsed_time / frames_analysed * (n_frames - frames_analysed)
+                print(f'Estimated time remaining: {remaining_time}')
+                print()
+            else:
+                print('100% complete')
+                print(f'{n_frames}/{n_frames} frames analysed in {elapsed_time}')
+                print(f'Average {elapsed_time/n_frames} per frame')
+
+    if args.nomp:
+        for file in gro_list:
+            results = main_loop(file, args.bins)
+            time_list.append(results[0])
+            depth_list1.append(results[1][0])
+            depthsum1 += results[1][1]
+            rescount1 += results[1][2]
+            depth_list2.append(results[2][0])
+            depthsum2 += results[2][1]
+            rescount2 += results[2][2]
+            if results[3]:
+                unassigned.append(results[3])
+
+            counter += 1
+            percent_progress = counter / n_frames * 100
+            print(f'{round(percent_progress, 2)}% complete')
+            elapsed_time = datetime.datetime.now() - start_time
+            print(f'{counter}/{n_frames} analysed in {elapsed_time}')
+            print(f'Average {counter/frames_analysed} per frame')
+            remaining_time = elapsed_time / counter * (n_frames - counter)
+            print(f'Estimated time remaining: {remaining_time}')
+            print()
+
+    np.seterr(divide='ignore', invalid='ignore')
+    depthmap1 = depthsum1 / rescount1
+    depthmap1 = depthmap1 - np.nanmin(depthmap1)
+    depthmap2 = depthsum2 / rescount2
+    depthmap2 = depthmap2 - np.nanmin(depthmap2)
+    np.seterr(divide='warn', invalid='warn')
+
+    ## Outputs ##
+
+    # Write csv of depth over time
+    time_depth_array = np.column_stack((time_list, depth_list1, depth_list2))
+    np.savetxt('depths.dat', time_depth_array)
+
+    # Output depthmap data
+    np.savetxt("depthmap1.dat", depthmap1)
+    np.savetxt("depthmap1_bin_rescounts.dat", rescount1)
+    np.savetxt("depthmap2.dat", depthmap2)
+    np.savetxt("depthmap2_bin_rescounts.dat", rescount2)
+
+    # Output graph of change in depth over course of simulation
+    plt.plot(time_list, depth_list1, linewidth=0.5)
+    plt.plot(time_list, depth_list2, linewidth=0.5)
+    plt.savefig("depth_over_time.svg")
+    plt.close()
+
+    # Plot depthmap data
+    hmplot = plt.imshow(depthmap1)
+    plt.colorbar(hmplot)
+    plt.savefig("depthmap1.pdf")
+    plt.savefig("depthmap1.svg")
+    plt.close()
+
+    ctplot = plt.contourf(depthmap1)
+    plt.colorbar(ctplot)
+    plt.savefig("contour1.pdf")
+    plt.savefig("contour1.svg")
+    plt.close()
+
+    hmplot = plt.imshow(depthmap2)
+    plt.colorbar(hmplot)
+    plt.savefig("depthmap2.pdf")
+    plt.savefig("depthmap2.svg")
+    plt.close()
+
+    ctplot = plt.contourf(depthmap2)
+    plt.colorbar(ctplot)
+    plt.savefig("contour2.pdf")
+    plt.savefig("contour2.svg")
+    plt.close()
+
+    if unassigned:
+        unassigned = np.vstack(unassigned)
+        np.savetxt('unassigned_lipids.dat', unassigned)
+
+    run_time = datetime.datetime.now() - start_time
+    with open('running_time.txt', 'w+') as f:
+        f.write(f'{n_frames} files processed over {run_time}\n')
+        f.write(f'Average {run_time/n_frames} per frame')
+        
