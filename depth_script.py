@@ -306,6 +306,7 @@ if __name__ == '__main__':
                 print()
             else:
                 print('100% complete')
+                elapsed_time = datetime.datetime.now() - start_time
                 print(f'{n_frames}/{n_frames} frames analysed in {elapsed_time}')
                 print(f'Average {elapsed_time/n_frames} per frame')
 
