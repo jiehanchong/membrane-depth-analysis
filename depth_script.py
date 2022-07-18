@@ -1,4 +1,8 @@
-import glob, multiprocessing, datetime, ctypes, functools, argparse, sys
+import glob
+import multiprocessing
+import datetime
+import functools
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.cluster import DBSCAN
@@ -57,17 +61,46 @@ def get_coords(file, coord_length):
     return resid_coords_arr
 
 
-def get_depth(leaflet): 
-    # Get average z of top 10%
-    top_cutoff = np.percentile(leaflet[:, 3], 90)
-    top_ten_percent = leaflet[:, 3][leaflet[:, 3] > top_cutoff]
-    average_top = np.mean(top_ten_percent)
+def get_depth(leaflet, method, dome=None):
+    '''Takes in the coordinates of headgroups in a leaflet, and returns the depth of the footprint for said leaflet.
+    If method=max_depth, the depth returned is simply the difference between the largest and smallest z-coordinate.
+    If method=domed, then the bilayer is presumed to be deformed in a dome shape by a protein shaped like a Piezo channel.
+    When method=domed, the depth returned is the depth of the dome - the difference between the average bilayer surface 
+    outside the dome, and the bottom of the dome.
+    The average bilayer surface is taken to be the average z-coordinate of the "highest" z-coordinates.
+    The bottom of the dome is simply the "lowest" z-coordinate, as the system is assumed to be fixed to the protein.
+    As a domed system might be assembled with the dome pointing either way, when method=dome then dome must also be 
+    defined as either "up" or "down"
+    dome=down corresponds to the concave surface of the dome facing towards larger z-coordinates, i.e. the bottom of the
+    dome will have smaller z-coordinates than the rest of the dome.
+    dome=up corresponds to the concave surface of the dome facing towards smaller z-coordinates, i.e. the bottom of the
+    dome will have larger z-coordinates than the rest of the dome'''
 
-    # Get z of lowest as this is fixed relative to protein, to which trajectory is fitted
-    bottom = np.min(leaflet[:, 3])
+    if method=='max_depth':
+        top = np.max(leaflet[:, 3])
+        bottom = np.min(leaflet[:, 3])
+
+    if method=='domed':
+        if dome=='down':
+            # Get average z of top 10%
+            top_cutoff = np.percentile(leaflet[:, 3], 90)
+            top_ten_percent = leaflet[:, 3][leaflet[:, 3] > top_cutoff]
+            top = np.mean(top_ten_percent)
+
+            # Get z of lowest as this is fixed relative to protein, to which trajectory is fitted
+            bottom = np.min(leaflet[:, 3])
+        
+        elif dome=='up':
+            # Get average z of top 10%
+            top_cutoff = np.percentile(leaflet[:, 3], 10)
+            top_ten_percent = leaflet[:, 3][leaflet[:, 3] < top_cutoff]
+            top = np.mean(top_ten_percent)
+
+            # Get z of lowest as this is fixed relative to protein, to which trajectory is fitted
+            bottom = np.max(leaflet[:, 3])
 
     # Calculate depth
-    depth = average_top - bottom
+    depth = top - bottom
 
     return depth
 
@@ -179,7 +212,7 @@ def make_depthmap(coords, x_bin_cutoffs, y_bin_cutoffs, bins):
     return depthsum, rescount
 
 
-def main_loop(file, bins):
+def main_loop(file, bins, method, dome=None):
     coord_length = get_coord_string_length(file)
     coords = get_coords(file, coord_length)
 
@@ -190,7 +223,7 @@ def main_loop(file, bins):
     function_output = [timestamp]
 
     for leaflet in (leaflet1, leaflet2):
-        depth = get_depth(leaflet)
+        depth = get_depth(leaflet, method, dome)
 
         x_cutoffs = bin_cutoffs(leaflet, 'x', bins)
         y_cutoffs = bin_cutoffs(leaflet, 'y', bins)
@@ -238,7 +271,7 @@ if __name__ == '__main__':
             running_time.txt            - performance metrics''')
     p.add_argument('--bins',
                 '-b',
-                help='''Number of bins in X and Y axis for output depth map. 
+                help='''Number of bins in X and Y axis for output depth map.
                         It is assumed that the X and Y dimensions of the 
                         simulation box are the same. Default is 75.''',
                 default=75,
@@ -254,12 +287,35 @@ if __name__ == '__main__':
                 dest='nomp',
                 action='store_true',
                 help='Turn off multiprocessing.')
+    p.add_argument('--method',
+                '-m',
+                help='''Method used to calculate dome depth.
+                        Default is "max_depth", which uses simple difference between 
+                        highest and lowest z-coordinates.
+                        For channels such as Piezo channels which create a
+                        discrete depression, using "domed" allows one to calculate the 
+                        difference between the main bilayer surface and the base of the
+                        dome.''',
+                type=str,
+                default="max_depth")
+    p.add_argument('--dome',
+                '-d',
+                help='''Dome direction if method is "domed". Can be "up" or "down",
+                where "up" refers to a dome protruding in the direction of the z-axis,
+                i.e. the convex surface points in the direction of more positive 
+                z-coordinates, and "down" is the opposite''',
+                default=None)
     args = p.parse_args()
 
 
     ##  ##  ##  ##  ##
     ##  ALGORITHM   ##
     ##  ##  ##  ##  ##
+
+    #Check correct input parameters
+    if args.method=='domed':
+        if args.dome==None:
+            raise SystemExit("Error: method is domed but dome not specified ('up' or 'down').")
 
     gro_list = glob.glob('*gro')
 
@@ -276,7 +332,7 @@ if __name__ == '__main__':
 
     if not args.nomp:
         # Fix start_time and n_frames in main loop as they are constant
-        pain_loop = functools.partial(main_loop, bins=args.bins)
+        pain_loop = functools.partial(main_loop, bins=args.bins, method=args.method, dome=args.dome)
 
         # Split gro_list into chunks for analysis
         chunk_generator = chunks(gro_list, args.chunksize)
@@ -312,7 +368,7 @@ if __name__ == '__main__':
 
     if args.nomp:
         for file in gro_list:
-            results = main_loop(file, args.bins)
+            results = main_loop(file, args.bins, args.method, args.dome)
             time_list.append(results[0])
             depth_list1.append(results[1][0])
             depthsum1 += results[1][1]
@@ -320,7 +376,7 @@ if __name__ == '__main__':
             depth_list2.append(results[2][0])
             depthsum2 += results[2][1]
             rescount2 += results[2][2]
-            if results[3]:
+            if results[3].size > 0:
                 unassigned.append(results[3])
 
             counter += 1
@@ -328,7 +384,7 @@ if __name__ == '__main__':
             print(f'{round(percent_progress, 2)}% complete')
             elapsed_time = datetime.datetime.now() - start_time
             print(f'{counter}/{n_frames} analysed in {elapsed_time}')
-            print(f'Average {counter/frames_analysed} per frame')
+            print(f'Average {elapsed_time/counter} per frame')
             remaining_time = elapsed_time / counter * (n_frames - counter)
             print(f'Estimated time remaining: {remaining_time}')
             print()
@@ -353,8 +409,15 @@ if __name__ == '__main__':
     np.savetxt("depthmap2_bin_rescounts.dat", rescount2)
 
     # Output graph of change in depth over course of simulation
-    plt.plot(time_list, depth_list1, linewidth=0.5)
-    plt.plot(time_list, depth_list2, linewidth=0.5)
+    time_sorted = []
+    depth1_sorted = []
+    depth2_sorted = []
+    for x, y, z in sorted(zip(time_list, depth_list1, depth_list2), key=lambda pair:pair[0]):
+        time_sorted.append(x)
+        depth1_sorted.append(y)
+        depth2_sorted.append(z)
+    plt.plot(time_sorted, depth1_sorted, linewidth=0.5)
+    plt.plot(time_sorted, depth2_sorted, linewidth=0.5)
     plt.savefig("depth_over_time.svg")
     plt.close()
 
